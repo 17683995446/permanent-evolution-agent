@@ -277,6 +277,8 @@ class MainLoopController:
         
         if self.execution_engine:
             status["execution"] = self.execution_engine.get_execution_summary()
+            if hasattr(self.execution_engine, 'get_detailed_statistics'):
+                status["execution_detailed"] = self.execution_engine.get_detailed_statistics()
         
         if self.optimizer_module:
             status["optimization"] = self.optimizer_module.get_optimization_summary()

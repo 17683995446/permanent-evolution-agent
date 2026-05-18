@@ -72,6 +72,7 @@ class TaskExecutionEngine:
         self._queue_lock = threading.Lock()
         self._is_running = False
         self._execution_thread: Optional[threading.Thread] = None
+        self._cleanup_thread: Optional[threading.Thread] = None
         self._applied_rules: Dict[str, Any] = {}
         self._execution_sequence = self.config.get_execution_rules()
         self._batch_size = self.config.get("execution.batch_size", 5)
@@ -79,6 +80,9 @@ class TaskExecutionEngine:
         self._task_result_cache: Dict[str, Any] = {}
         self._log_sampling_rate = 0.01
         self._tasks_since_last_log = 0
+        self._max_completed_tasks = 1000
+        self._cleanup_interval = 60
+        self._last_cleanup_time = time.time()
         gc.collect()
 
     def initialize(self):
@@ -87,6 +91,8 @@ class TaskExecutionEngine:
         self._is_running = True
         self._execution_thread = threading.Thread(target=self._execution_loop, daemon=True)
         self._execution_thread.start()
+        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
+        self._cleanup_thread.start()
         self._register_default_handlers()
         self.log.log_guardian_event("start", "Task execution engine initialized")
 
@@ -95,9 +101,12 @@ class TaskExecutionEngine:
         self._is_running = False
         if self._execution_thread:
             self._execution_thread.join(timeout=5)
+        if self._cleanup_thread:
+            self._cleanup_thread.join(timeout=5)
         if self._executor:
             self._executor.shutdown(wait=True)
         self._task_result_cache.clear()
+        self._completed_tasks.clear()
         self.log.info("Task execution engine shutdown complete")
 
     def register_task_handler(self, task_type: str, handler: Callable[[Task], Any]):
@@ -529,3 +538,73 @@ class TaskExecutionEngine:
             del self._task_result_cache[task_id]
         if to_remove:
             self.log.debug(f"Cleaned up {len(to_remove)} old cached results")
+    
+    def _cleanup_loop(self):
+        """定期清理循环 - 自动管理内存"""
+        while self._is_running:
+            try:
+                time.sleep(self._cleanup_interval)
+                if time.time() - self._last_cleanup_time >= self._cleanup_interval:
+                    self._perform_cleanup()
+                    self._last_cleanup_time = time.time()
+            except Exception as e:
+                self.log.error(f"Cleanup loop error: {e}")
+    
+    def _perform_cleanup(self):
+        """执行实际的清理操作"""
+        with self._execution_lock:
+            completed_count = len(self._completed_tasks)
+            if completed_count > self._max_completed_tasks:
+                to_remove = completed_count - self._max_completed_tasks
+                sorted_tasks = sorted(
+                    self._completed_tasks.items(),
+                    key=lambda x: x[1].completed_at if x[1].completed_at else 0
+                )
+                for task_id, _ in sorted_tasks[:to_remove]:
+                    del self._completed_tasks[task_id]
+                self.log.debug(f"Cleaned up {to_remove} old completed tasks")
+        
+        self.cleanup_old_results(max_age_seconds=1800)
+        
+        if len(self._tasks) > 5000:
+            with self._queue_lock:
+                active_ids = set()
+                for task in self._task_queue:
+                    active_ids.add(task.task_id)
+                with self._execution_lock:
+                    for task_id in self._running_tasks:
+                        active_ids.add(task_id)
+                    for task_id in self._completed_tasks:
+                        active_ids.add(task_id)
+                to_remove = [tid for tid in self._tasks if tid not in active_ids]
+                for task_id in to_remove:
+                    del self._tasks[task_id]
+                if to_remove:
+                    self.log.debug(f"Cleaned up {len(to_remove)} orphaned tasks")
+        
+        gc.collect()
+    
+    def get_detailed_statistics(self) -> Dict[str, Any]:
+        """获取详细的统计信息"""
+        with self._execution_lock:
+            running = len(self._running_tasks)
+            completed = len(self._completed_tasks)
+        
+        with self._queue_lock:
+            pending = len(self._task_queue)
+            priority_counts = {}
+            for task in self._task_queue:
+                prio_name = task.priority.name
+                priority_counts[prio_name] = priority_counts.get(prio_name, 0) + 1
+        
+        cache_size = len(self._task_result_cache)
+        
+        return {
+            "running_tasks": running,
+            "pending_tasks": pending,
+            "completed_tasks": completed,
+            "task_cache_size": cache_size,
+            "pending_by_priority": priority_counts,
+            "max_workers": self._max_workers,
+            "utilization": round(running / self._max_workers * 100, 2) if self._max_workers > 0 else 0
+        }
