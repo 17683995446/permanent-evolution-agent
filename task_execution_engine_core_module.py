@@ -208,12 +208,23 @@ class TaskExecutionEngine:
         metadata: Optional[Dict] = None
     ) -> str:
         """提交新任务到执行队列"""
+        # 验证任务类型
+        if not isinstance(task_type, str) or not task_type:
+            task_type = "default"
+            self.log.debug(f"Invalid task type, using 'default' instead")
+        
+        # 验证metadata
+        if metadata is None:
+            metadata = {}
+        elif not isinstance(metadata, dict):
+            metadata = {"raw_metadata": metadata}
+        
         task = Task(
             task_id=str(uuid.uuid4())[:8],
             task_type=task_type,
             payload=payload,
             priority=priority,
-            metadata=metadata or {}
+            metadata=metadata
         )
         with self._queue_lock:
             self._tasks[task.task_id] = task
